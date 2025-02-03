@@ -41,10 +41,21 @@ export default class SpotifySongDisplayExtension {
     }
 
     const { title, url } = getSpotifyMetadata();
-    if (!title || !url) return;
+    if (!title || !url) {
+      this._label.set_text("Couldn't find song");
+    }
 
     const truncatedTitle =
       title.slice(0, 25) + (title.length > 25 ? "..." : "");
+    this._label.set_text(`Preparing: ${truncatedTitle}`);
+
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+      this._initiateDownload(title, url, truncatedTitle);
+      return false;
+    });
+  }
+
+  _initiateDownload(fullTitle, url, truncatedTitle) {
     const downloadFolder = GLib.get_home_dir() + "/Music";
 
     try {
@@ -62,7 +73,7 @@ export default class SpotifySongDisplayExtension {
       }
 
       this._currentDownloadPid = pid;
-      this._setupProcessWatch(pid, title, truncatedTitle);
+      this._setupProcessWatch(pid, fullTitle, truncatedTitle);
       this._handleOutputStream(stdout, stderr, truncatedTitle);
     } catch (error) {
       this._handleDownloadError(error);
@@ -78,6 +89,9 @@ export default class SpotifySongDisplayExtension {
       // Cleanup streams
       this._streams.forEach((stream) => stream.close());
       this._streams.clear();
+
+      // Close the PID
+      GLib.spawn_close_pid(pid);
 
       GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
         if (!this._isDownloading) {
@@ -147,6 +161,10 @@ export default class SpotifySongDisplayExtension {
     Main.panel.addToStatusArea("spotify-song-display", this._button, 3, "left");
     this._button.hide();
 
+    if (this._timeoutId) {
+      GLib.Source.remove(this._timeoutId);
+    }
+
     this._timeoutId = GLib.timeout_add_seconds(
       GLib.PRIORITY_DEFAULT,
       2,
@@ -166,7 +184,15 @@ export default class SpotifySongDisplayExtension {
 
     if (this._currentDownloadPid) {
       try {
-        GLib.spawn_command_line_sync(`kill ${this._currentDownloadPid}`);
+        GLib.spawn_async(
+          null,
+          ["kill", this._currentDownloadPid.toString()],
+          null,
+          GLib.SpawnFlags.SEARCH_PATH,
+          null,
+        );
+
+        GLib.spawn_close_pid(this._currentDownloadPid);
       } catch (error) {
         console.error(`Error killing download process: ${error.message}`);
       }

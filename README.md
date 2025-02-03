@@ -8,6 +8,18 @@ A GNOME Shell extension that displays your currently playing Spotify song in the
 - One-click download functionality
 - Checkmark (✓) indicator for previously downloaded songs
 
+## Images
+
+![Screenshot 1](./media/normal.png)
+
+---
+
+![Screenshot 2](./media/downloading.png)
+
+---
+
+![Screenshot 3](./media/completed.png)
+
 ## Requirements
 
 - GNOME Shell 45 or later
