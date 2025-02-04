@@ -113,6 +113,7 @@ export default class SpotifySongDisplayExtension {
       const stream = new Gio.DataInputStream({
         base_stream: new Gio.UnixInputStream({ fd, close_fd: true }),
       });
+
       this._streams.set(fd, stream);
 
       const readLine = () => {
