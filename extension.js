@@ -4,58 +4,84 @@ import Clutter from "gi://Clutter";
 import * as PanelMenu from "resource:///org/gnome/shell/ui/panelMenu.js";
 import * as Main from "resource:///org/gnome/shell/ui/main.js";
 import Gio from "gi://Gio";
-import { processDownloadOutput, getSpotifyMetadata } from "./utils.js";
+import { processDownloadOutput, truncateTitle } from "./utils.js";
+import { SpotifyDBus } from "./spotify-dbus.js";
 
 export default class SpotifySongDisplayExtension {
   constructor() {
-    this._timeoutId = null;
+    this._dbus = null;
     this._label = null;
     this._button = null;
     this._isDownloading = false;
     this._currentDownloadPid = null;
     this._downloadedSongs = new Set();
-    this._downloadQueue = [];
     this._streams = new Map();
+    this._timeouts = [];
+    this._childWatches = [];
   }
 
-  _updateSong = () => {
-    if (this._isDownloading) return true;
+  _addTimeout(fn, interval, seconds = false) {
+    let id;
+    if (seconds) {
+      id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, fn);
+    } else {
+      id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, interval, fn);
+    }
+    this._timeouts.push(id);
+    return id;
+  }
 
-    const { title, success } = getSpotifyMetadata();
-    if (success && title) {
-      const displayTitle = this._downloadedSongs.has(title)
-        ? `${title} ✓`
-        : title;
+  _removeTimeouts() {
+    this._timeouts.forEach((id) => GLib.Source.remove(id));
+    this._timeouts = [];
+  }
+
+  _removeChildWatches() {
+    this._childWatches.forEach((id) => GLib.Source.remove(id));
+    this._childWatches = [];
+  }
+
+  updateLabel() {
+    if (this._isDownloading) return;
+
+    if (!this._dbus.spotifyIsActive()) {
+      this._button.hide();
+      return;
+    }
+
+    const metadata = this._dbus.getMetadata();
+    if (metadata.success && metadata.title) {
+      const displayTitle = this._downloadedSongs.has(metadata.title)
+        ? `${truncateTitle(metadata.title)} ✓`
+        : truncateTitle(metadata.title);
       this._label.set_text(displayTitle);
       this._button.show();
     } else {
       this._button.hide();
     }
-    return true;
-  };
+  }
 
   async _handleDownload() {
     if (this._isDownloading) {
-      console.log("Download already in progress");
+      log("Download already in progress");
       return;
     }
 
-    const { title, url } = getSpotifyMetadata();
-    if (!title || !url) {
+    const metadata = this._dbus.getMetadata();
+    if (!metadata.success || !metadata.title || !metadata.url) {
       this._label.set_text("Couldn't find song");
+      return;
     }
 
-    const truncatedTitle =
-      title.slice(0, 25) + (title.length > 25 ? "..." : "");
-    this._label.set_text(`Preparing: ${truncatedTitle}`);
+    this._label.set_text(`Preparing: ${truncateTitle(metadata.title)}`);
 
-    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-      this._initiateDownload(title, url, truncatedTitle);
+    this._addTimeout(() => {
+      this._initiateDownload(metadata.title, metadata.url);
       return false;
-    });
+    }, 50);
   }
 
-  _initiateDownload(fullTitle, url, truncatedTitle) {
+  _initiateDownload(fullTitle, url) {
     const downloadFolder = GLib.get_home_dir() + "/Music";
 
     try {
@@ -73,39 +99,40 @@ export default class SpotifySongDisplayExtension {
       }
 
       this._currentDownloadPid = pid;
-      this._setupProcessWatch(pid, fullTitle, truncatedTitle);
-      this._handleOutputStream(stdout, stderr, truncatedTitle);
+      this._setupProcessWatch(pid, fullTitle);
+      this._handleOutputStream(stdout, stderr, truncateTitle(fullTitle));
     } catch (error) {
       this._handleDownloadError(error);
     }
   }
 
-  _setupProcessWatch(pid, fullTitle, truncatedTitle) {
-    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, () => {
+  _setupProcessWatch(pid, fullTitle) {
+    let childWatchId = GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, () => {
       this._isDownloading = false;
       this._currentDownloadPid = null;
       this._downloadedSongs.add(fullTitle);
 
-      // Cleanup streams
-      this._streams.forEach((stream) => stream.close());
-      this._streams.clear();
-
-      // Close the PID
-      GLib.spawn_close_pid(pid);
-
-      GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-        if (!this._isDownloading) {
-          const { title: currentTitle } = getSpotifyMetadata();
-          if (currentTitle) {
-            const displayTitle = this._downloadedSongs.has(currentTitle)
-              ? `${currentTitle} ✓`
-              : currentTitle;
-            this._label.set_text(displayTitle);
+      this._streams.forEach((stream, fd) => {
+        if (!stream.is_closed()) {
+          try {
+            stream.close(null);
+          } catch (error) {
+            logError(error, "Error closing stream");
           }
         }
-        return false;
       });
+      this._streams.clear();
+
+      GLib.spawn_close_pid(pid);
+
+      this._addTimeout(() => {
+        if (!this._isDownloading) {
+          this.updateLabel();
+        }
+        return false;
+      }, 2000);
     });
+    this._childWatches.push(childWatchId);
   }
 
   _handleOutputStream(stdout, stderr, truncatedTitle) {
@@ -125,13 +152,11 @@ export default class SpotifySongDisplayExtension {
               if (this._isDownloading) {
                 this._label.set_text(`${truncatedTitle} -> ${status}`);
               }
-              console.log(`${isError ? "Error" : "Download"}: ${line}`);
+              log(`${isError ? "Error" : "Download"}: ${line}`);
               readLine();
             }
           } catch (error) {
-            console.error(
-              `Error reading ${isError ? "stderr" : "stdout"}: ${error.message}`,
-            );
+            logError(error, `Error reading ${isError ? "stderr" : "stdout"}`);
           }
         });
       };
@@ -146,11 +171,10 @@ export default class SpotifySongDisplayExtension {
   _handleDownloadError(error) {
     this._isDownloading = false;
     this._label.set_text("Download failed");
-    console.error(`Error downloading song: ${error.message}`);
+    logError(error, "Error downloading song");
   }
 
   enable() {
-    this._downloadedSongs.clear();
     this._button = new PanelMenu.Button(0.0, "Spotify Song Display");
     this._label = new St.Label({
       text: "Loading...",
@@ -162,26 +186,16 @@ export default class SpotifySongDisplayExtension {
     Main.panel.addToStatusArea("spotify-song-display", this._button, 3, "left");
     this._button.hide();
 
-    if (this._timeoutId) {
-      GLib.Source.remove(this._timeoutId);
-    }
-
-    this._timeoutId = GLib.timeout_add_seconds(
-      GLib.PRIORITY_DEFAULT,
-      2,
-      this._updateSong,
-    );
+    this._dbus = new SpotifyDBus(this);
+    this._addTimeout(() => {
+      this.updateLabel();
+      return true;
+    }, 2000);
   }
 
   disable() {
-    this._cleanup();
-  }
-
-  _cleanup() {
-    if (this._timeoutId) {
-      GLib.Source.remove(this._timeoutId);
-      this._timeoutId = null;
-    }
+    this._removeTimeouts();
+    this._removeChildWatches();
 
     if (this._currentDownloadPid) {
       try {
@@ -192,15 +206,22 @@ export default class SpotifySongDisplayExtension {
           GLib.SpawnFlags.SEARCH_PATH,
           null,
         );
-
         GLib.spawn_close_pid(this._currentDownloadPid);
       } catch (error) {
-        console.error(`Error killing download process: ${error.message}`);
+        logError(error, "Error killing download process");
       }
+      this._currentdownloadpid = null;
     }
 
-    // Clean up streams
-    this._streams.forEach((stream) => stream.close());
+    this._streams.forEach((stream, fd) => {
+      if (!stream.is_closed()) {
+        try {
+          stream.close(null);
+        } catch (error) {
+          logError(error, "Error closing stream");
+        }
+      }
+    });
     this._streams.clear();
 
     if (this._button) {
@@ -210,6 +231,6 @@ export default class SpotifySongDisplayExtension {
 
     this._downloadedSongs.clear();
     this._isDownloading = false;
-    this._currentDownloadPid = null;
+    this._dbus = null;
   }
 }
