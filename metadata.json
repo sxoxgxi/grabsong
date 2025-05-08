@@ -2,6 +2,6 @@
   "name": "Grab Song",
   "description": "A GNOME Shell extension that displays your currently playing Spotify song in the top panel and allows you to download it with a single click using spotdl.",
   "uuid": "grabsong@sxoxgxi",
-  "shell-version": ["46", "45", "47"],
+  "shell-version": ["46", "45", "47", "48"],
   "url": "https://github.com/sxoxgxi/grabsong"
 }
